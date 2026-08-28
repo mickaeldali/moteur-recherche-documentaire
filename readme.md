@@ -1,6 +1,6 @@
 # Moteur de recherche documentaire
 
-Projet n°3 du parcours LegalTech — application locale qui permet d'interroger le **contenu texte** des documents juridiques importés, et non plus seulement leurs métadonnées comme au projet 2. Trois façons de chercher coexistent : FTS5 (mots-clés, plein texte classique), une recherche par **sens** (embeddings OpenAI), et depuis le projet 4, la possibilité de **poser une question** à laquelle un LLM rédige une vraie réponse à partir des passages retrouvés (RAG -- retrieval-augmented generation), avec citation systématique des extraits bruts pour rester vérifiable.
+Projet n°3 du parcours LegalTech — application locale qui permet d'interroger le **contenu texte** des documents juridiques importés, et non plus seulement leurs métadonnées comme au projet 2. Trois façons de chercher coexistent : FTS5 (mots-clés, plein texte classique), une recherche par **sens** (embeddings OpenAI), et depuis le projet 4, la possibilité de **poser une question** à laquelle un LLM rédige une vraie réponse à partir des passages retrouvés (RAG -- retrieval-augmented generation), avec citation systématique des extraits bruts pour rester vérifiable. Depuis le projet 5, un mini **assistant d'analyse contractuelle** détecte un type de clause tapé librement dans un document, l'analyse et lui attribue un niveau de risque, avec un historique exportable en Excel.
 
 ## Fonctionnalités
 
@@ -20,6 +20,13 @@ Projet n°3 du parcours LegalTech — application locale qui permet d'interroger
   - format de sortie JSON strict imposé au modèle (schéma avec deux champs distincts) : une réponse ancrée dans le document, et un éventuel complément de connaissance générale du LLM, uniquement si la question déborde du document
   - le texte cité en source n'est **jamais** demandé au LLM : c'est le `texte_chunk` déjà stocké en base à l'indexation, affiché séparément dans une section « Sources », pour rester vérifiable même si le LLM paraphrase
   - affichage visuellement distinct entre la réponse ancrée (« trouvée dans le document ») et le complément de connaissance générale (« à vérifier »)
+- **Analyser une clause** (projet 5, mini assistant d'analyse contractuelle) :
+  - l'utilisateur choisit un document et tape librement un type de clause (pas de liste prédéfinie), ex. « non-concurrence », « confidentialité »
+  - détection en deux étapes : une présélection par similarité de sens (comme « Par sens »), puis une **vérification par le LLM** que les extraits présélectionnés correspondent vraiment à ce type de clause (voir la note d'architecture plus bas — la similarité seule ne suffit pas)
+  - si confirmée : analyse rédigée par le LLM (adaptée au type de clause) + niveau de risque sur une échelle fixe (faible / moyen / élevé), affiché avec un badge coloré
+  - le texte cité reste, comme pour le RAG, l'extrait brut stocké en base, jamais reformulé par le LLM
+  - chaque analyse est enregistrée durablement (table `documents_clauses`), pour accumuler plusieurs analyses sans refaire d'appels API déjà payés
+  - export Excel de tout l'historique accumulé (`pandas` + `openpyxl`, en mémoire, même principe que le projet 1)
 - Filtre par catégorie juridique, combinable avec les trois modes de recherche
 - Une recherche vide (mode mots-clés) affiche tous les documents (comme au projet 2)
 - Aperçu du texte extrait, modification (catégorie/commentaire), suppression (base + fichier + les deux index)
@@ -27,16 +34,18 @@ Projet n°3 du parcours LegalTech — application locale qui permet d'interroger
   - si l'extraction échoue (format non supporté, PDF scanné en image...), le document est quand même importé, avec un message clair indiquant qu'il ne sera pas trouvable par une recherche de contenu
   - si l'indexation par sens échoue (pas de clé API OpenAI, pas de réseau, quota dépassé...), le document reste importé et trouvable par mots-clés, avec un message clair indiquant qu'il ne sera pas trouvable par une recherche par sens
 - Résilience du mode « Poser une question » : si la génération de la réponse échoue (clé absente, quota, réseau), les passages bruts retrouvés restent affichés, seule la synthèse rédigée est indisponible, avec un message clair
+- Résilience de l'analyse de clauses : si la détection réussit mais que l'analyse par le LLM échoue, la clause est quand même enregistrée comme « détectée mais pas encore analysée », plutôt que de perdre la détection
 
 ## Structure du projet
 
 ```text
 moteur_recherche_documentaire/
 ├── app.py            # interface Streamlit
-├── database.py       # SQLite : table documents + index FTS5 + index embeddings
+├── database.py       # SQLite : table documents + index FTS5 + index embeddings + historique clauses
 ├── recherche.py       # construction de la requête FTS5 à partir du texte tapé
 ├── embeddings.py       # découpage en chunks, appel à l'API OpenAI (embeddings), similarité cosinus
 ├── llm.py               # RAG : prompt, appel au modèle de chat, schéma JSON imposé (projet 4)
+├── clauses.py            # analyse de clauses : prompt, vérification + schéma JSON imposé (projet 5)
 ├── fichiers.py         # sauvegarde/suppression physique des fichiers (repris du projet 2)
 ├── extraction.py       # extraction du texte PDF/DOCX/TXT (repris du projet 2)
 ├── documents/           # fichiers importés (non versionné)
@@ -48,6 +57,7 @@ moteur_recherche_documentaire/
 │   ├── test_recherche.py
 │   ├── test_embeddings.py
 │   ├── test_llm.py
+│   ├── test_clauses.py
 │   ├── test_fichiers.py
 │   └── test_extraction.py
 ├── requirements.txt
@@ -82,7 +92,7 @@ streamlit run app.py
 python -m pytest -v
 ```
 
-Les tests ne font aucun appel réseau réel à l'API OpenAI : `calculer_embedding` est mocké dans `test_embeddings.py` et `test_database.py`, `generer_reponse` (chat) est mocké dans `test_llm.py`.
+Les tests ne font aucun appel réseau réel à l'API OpenAI : `calculer_embedding` est mocké dans `test_embeddings.py` et `test_database.py`, `generer_reponse` (chat) dans `test_llm.py`, `analyser_clause` (chat) dans `test_clauses.py`.
 
 ## Note d'architecture : pourquoi FTS5
 
@@ -123,4 +133,18 @@ Principe (`llm.generer_reponse`) :
 4. **La citation de la source n'est jamais demandée au LLM** (risque de légère reformulation). L'extrait affiché dans la section « Sources » de `app.py` est le `texte_chunk` déjà stocké tel quel dans `documents_embeddings` à l'indexation -- la même donnée que pour la recherche par sens. Principe retenu pour ce projet : tout ce que le code sait déjà de façon fiable ne doit pas être redemandé au LLM.
 5. Résilience : `generer_reponse()` ne rattrape aucune erreur (comme `calculer_embedding`) -- `embeddings.CleApiManquante` ou une exception `openai` (réseau, quota...) remonte jusqu'à `app.py`, qui affiche un message clair à la place de la synthèse, sans empêcher l'affichage des passages bruts déjà retrouvés.
 
-C'est cette étape qui ouvre la voie au projet 5 : l'extraction structurée de clauses et la qualification de risques, en s'appuyant sur le même principe (schéma JSON imposé, citation vérifiable) plutôt que sur du texte libre.
+## Note d'architecture : l'analyse de clauses (projet 5, `clauses.py`)
+
+Objectif : taper librement un type de clause (pas de liste prédéfinie) pour un document donné, détecter si elle existe, la faire analyser par un LLM avec un niveau de risque, et accumuler l'historique pour un export Excel.
+
+**Détection en deux étapes -- pas une seule.** Un point important, découvert en testant en conditions réelles pendant le développement : la seule similarité cosinus ne suffit pas à décider fiablement si une clause précise est présente ou non. Sur un contrat de test ne contenant qu'une clause de non-concurrence, demander « clause de brevet et de droits d'auteur » (absente du document) obtenait un score de similarité de 0,39 -- plus élevé que le score de 0,34 obtenu en cherchant "non-concurrence" (la clause réellement présente, mais ailleurs dans un autre test) ! Deux clauses du même domaine juridique peuvent avoir un score de similarité proche même quand l'une des deux n'existe pas dans le document : la similarité de sens capte surtout le domaine (« c'est du droit du travail ») plus finement que le sujet précis. Pire : demander au LLM d'analyser directement ce passage comme s'il s'agissait de la clause demandée a produit une analyse détaillée avec un niveau de risque « élevé », alors que le document ne traite pas du tout du sujet demandé -- le LLM avait bien remarqué l'incohérence dans son texte, mais produisait quand même une analyse complète plutôt que de refuser.
+
+La détection se fait donc en deux étapes, avec un rôle différent à chacune :
+1. **Présélection (rappel)** : `database.rechercher_par_sens(type_clause, doc_id=...)` puis `llm.filtrer_chunks_pertinents()` (réutilisés tels quels, même seuil `llm.SEUIL_SIMILARITE_MINIMAL`) retrouvent des **candidats** -- orientés "ne rien rater", pas "ne jamais se tromper".
+2. **Vérification (précision)** : `clauses.analyser_clause()` impose un schéma JSON (`clauses.SCHEMA_ANALYSE_CLAUSE`) avec un champ `clause_correspond` (booléen) que le LLM doit remplir *avant* de rédiger son analyse, en vérifiant lui-même si les extraits présélectionnés correspondent vraiment au type de clause demandé. Si `clause_correspond` vaut `false`, `app.py` traite la clause comme **absente**, même si l'étape 1 avait trouvé un candidat au-dessus du seuil -- l'analyse et le niveau de risque produits dans ce cas ne sont jamais enregistrés.
+
+**Schéma JSON strict** (`clauses.SCHEMA_ANALYSE_CLAUSE`), trois champs obligatoires : `clause_correspond` (booléen, la vérification ci-dessus), `analyse` (texte libre, adapté au type de clause précis -- volontairement un champ générique plutôt que des champs fixes par type de clause, les critères pertinents variant trop d'un type à l'autre), `niveau_risque` (`enum` strict à 3 valeurs : `faible`/`moyen`/`élevé`, seul champ réellement structuré et exploitable dans l'export).
+
+**Citation et stockage**, mêmes principes que le RAG : le texte affiché (`texte_extrait`) est toujours l'extrait brut tel que stocké en base, jamais reformulé par le LLM. Chaque analyse est enregistrée durablement dans `documents_clauses` (`doc_id`, `type_clause`, `clause_presente`, `texte_extrait`, `analyse`, `niveau_risque`, `date_analyse`), y compris en cas d'échec de l'appel au LLM après une détection réussie (`analyse`/`niveau_risque` restent `NULL` : « détectée mais pas encore analysée » plutôt qu'une détection perdue) -- accumuler l'historique évite de refaire des appels API déjà payés, et prépare le terrain pour le projet final (due diligence multi-documents).
+
+**Export Excel** (`app.py`) : même principe que le projet 1 (`pandas.ExcelWriter` + `openpyxl` pour la mise en forme, fichier construit en mémoire via `io.BytesIO`, jamais écrit sur disque), une ligne par analyse enregistrée dans `documents_clauses`, tous documents confondus.

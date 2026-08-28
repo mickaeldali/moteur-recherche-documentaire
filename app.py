@@ -2,7 +2,7 @@
 app.py
 
 Interface Streamlit du moteur de recherche documentaire (projet 3 + étapes
-recherche par sens et RAG / projet 4).
+recherche par sens, RAG / projet 4, et analyse de clauses / projet 5).
 
 Reprend l'import de documents du projet 2 (fichiers.py, extraction.py,
 database.py) et propose trois façons d'interroger le CONTENU TEXTUEL des
@@ -14,12 +14,22 @@ documents (pas seulement leurs métadonnées comme au projet 2) :
 - en POSANT UNE QUESTION (projet 4, RAG) : retrouve les passages pertinents
   par sens, puis les envoie à un LLM qui rédige une vraie réponse -- tout en
   affichant séparément les extraits bruts, pour rester vérifiable.
+
+S'y ajoute une section "Analyser une clause" (projet 5) : pour un document
+et un type de clause tapé librement, détecte si la clause existe (même
+principe que "par sens" et le RAG), la fait analyser par un LLM avec un
+niveau de risque, et permet d'exporter l'historique accumulé en Excel.
 """
 
+import io
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
+import clauses
 import database
 import embeddings
 import extraction
@@ -277,3 +287,163 @@ else:
                 st.write(f"Type : {type_fichier}")
                 st.write(f"Chemin : {chemin}")
                 st.markdown(f"Extrait original : *{texte_chunk}*")
+
+st.divider()
+
+# ----------------------------------------------------------------------
+# Analyse de clauses (projet 5) : pour un document et un type de clause
+# tapé librement, détecte si la clause existe (même principe que "par
+# sens" ci-dessus : au moins un chunk au-dessus du seuil de pertinence),
+# la fait analyser par un LLM avec un niveau de risque, et accumule
+# l'historique en base pour un export Excel global.
+# ----------------------------------------------------------------------
+st.header("Analyser une clause")
+
+documents_existants = database.lire_documents()
+
+if not documents_existants:
+    st.info("Importe d'abord un document pour pouvoir y analyser une clause.")
+else:
+    noms_documents = {f"{doc[1]} (id {doc[0]})": doc[0] for doc in documents_existants}
+    nom_document_choisi = st.selectbox("Document à analyser", list(noms_documents.keys()))
+    doc_id_choisi = noms_documents[nom_document_choisi]
+
+    type_clause = st.text_input(
+        "Type de clause à rechercher",
+        placeholder="ex. non-concurrence, confidentialité, résiliation",
+    )
+
+    if st.button("Analyser cette clause"):
+        if not type_clause.strip():
+            st.warning("Tape d'abord un type de clause.")
+        else:
+            # Étape 1 : détection PRÉLIMINAIRE, restreinte à CE document
+            # (doc_id) -- même principe que la recherche par sens et le
+            # RAG : un chunk est jugé CANDIDAT au-dessus de
+            # llm.SEUIL_SIMILARITE_MINIMAL. Un candidat n'est pas une
+            # confirmation : voir clauses.py, la similarité de sens seule
+            # peut confondre deux clauses de même domaine juridique.
+            try:
+                resultats_bruts = database.rechercher_par_sens(
+                    type_clause, doc_id=doc_id_choisi, top_n=llm.NB_CHUNKS_CONTEXTE,
+                )
+                chunks_candidats = llm.filtrer_chunks_pertinents(resultats_bruts)
+            except embeddings.CleApiManquante as erreur:
+                st.error(str(erreur))
+                chunks_candidats = None
+            except Exception as erreur:
+                st.error(f"Détection indisponible : {erreur}")
+                chunks_candidats = None
+
+            # chunks_candidats à None = la détection elle-même a échoué :
+            # on ne sait pas si la clause est présente, donc on n'enregistre
+            # rien. [] = aucun candidat trouvé, absence claire : ça
+            # s'enregistre directement, sans appel au LLM.
+            if chunks_candidats is not None:
+                clause_presente, texte_extrait, analyse, niveau_risque = False, None, None, None
+
+                if not chunks_candidats:
+                    st.info(f"Aucune clause de type « {type_clause} » détectée dans ce document.")
+                else:
+                    # Étape 2 : le LLM vérifie lui-même si les candidats
+                    # correspondent VRAIMENT au type de clause demandé
+                    # (clause_correspond) avant d'analyser -- c'est cette
+                    # vérification, pas le score de similarité, qui décide
+                    # de la présence finale. Si l'appel échoue, la ligne
+                    # est quand même enregistrée comme "détectée mais non
+                    # vérifiée/analysée", pour ne pas perdre le candidat
+                    # déjà trouvé (résilience demandée).
+                    try:
+                        resultat_analyse = clauses.analyser_clause(type_clause, chunks_candidats)
+                        if resultat_analyse["clause_correspond"]:
+                            clause_presente = True
+                            texte_extrait = "\n\n".join(r[-2] for r in chunks_candidats)
+                            analyse = resultat_analyse["analyse"]
+                            niveau_risque = resultat_analyse["niveau_risque"]
+                            st.success("Clause détectée et analysée.")
+                        else:
+                            st.info(
+                                f"Un passage proche par le sens a été trouvé, mais l'IA a "
+                                f"vérifié qu'il ne correspond pas à une clause de type "
+                                f"« {type_clause} » : absente."
+                            )
+                    except embeddings.CleApiManquante as erreur:
+                        clause_presente = True
+                        texte_extrait = "\n\n".join(r[-2] for r in chunks_candidats)
+                        st.warning(f"Clause candidate détectée mais non vérifiée/analysée : {erreur}")
+                    except Exception as erreur:
+                        clause_presente = True
+                        texte_extrait = "\n\n".join(r[-2] for r in chunks_candidats)
+                        st.warning(f"Clause candidate détectée mais non vérifiée/analysée : {erreur}")
+
+                database.enregistrer_analyse_clause(
+                    doc_id_choisi, type_clause, clause_presente, texte_extrait, analyse, niveau_risque,
+                )
+                st.rerun()
+
+    # ------------------------------------------------------------------
+    # Historique des analyses accumulées (tous documents confondus) et
+    # export Excel, sur le principe du projet 1 (pandas + openpyxl, en
+    # mémoire via BytesIO, pas de fichier temporaire sur disque).
+    # ------------------------------------------------------------------
+    st.subheader("Historique des analyses")
+
+    BADGES_RISQUE = {"élevé": st.error, "moyen": st.warning, "faible": st.success}
+
+    analyses = database.lire_analyses_clauses()
+
+    if not analyses:
+        st.write("Aucune analyse enregistrée pour l'instant.")
+    else:
+        for ligne in analyses:
+            id_analyse, nom, type_clause_ligne, presente, texte_extrait, analyse_texte, niveau_risque, date_analyse = ligne
+
+            titre = f"{nom} — {type_clause_ligne} — {'présente' if presente else 'absente'}"
+            with st.expander(titre):
+                st.write(f"Date de l'analyse : {date_analyse}")
+                if not presente:
+                    st.write("Clause non détectée dans ce document.")
+                else:
+                    st.markdown(f"Extrait original : *{texte_extrait}*")
+                    if analyse_texte and niveau_risque:
+                        afficher_badge = BADGES_RISQUE.get(niveau_risque, st.write)
+                        afficher_badge(f"Niveau de risque : {niveau_risque}")
+                        st.write(analyse_texte)
+                    else:
+                        st.info("Clause détectée mais pas encore analysée (l'analyse par IA a échoué).")
+
+        # Construction du fichier Excel en mémoire (io.BytesIO) : aucun
+        # fichier n'est écrit sur le disque, il n'existe que le temps du
+        # téléchargement par l'utilisateur.
+        colonnes = [
+            "Document", "Type de clause", "Présente", "Extrait", "Analyse", "Niveau de risque", "Date",
+        ]
+        lignes_export = [
+            (nom, type_clause_ligne, "Oui" if presente else "Non", texte_extrait, analyse_texte, niveau_risque, date_analyse)
+            for (_, nom, type_clause_ligne, presente, texte_extrait, analyse_texte, niveau_risque, date_analyse) in analyses
+        ]
+        df_export = pd.DataFrame(lignes_export, columns=colonnes)
+
+        fichier_excel = io.BytesIO()
+        with pd.ExcelWriter(fichier_excel, engine="openpyxl") as writer:
+            df_export.to_excel(writer, index=False, sheet_name="Analyses de clauses")
+            feuille = writer.sheets["Analyses de clauses"]
+
+            for cellule in feuille[1]:
+                cellule.font = Font(bold=True)
+                cellule.fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+                cellule.alignment = Alignment(horizontal="center")
+
+            for colonne in feuille.columns:
+                largeur_max = max((len(str(cellule.value)) for cellule in colonne if cellule.value is not None), default=0)
+                lettre_colonne = get_column_letter(colonne[0].column)
+                feuille.column_dimensions[lettre_colonne].width = min(largeur_max + 2, 60)
+
+        fichier_excel.seek(0)
+
+        st.download_button(
+            label="Télécharger l'historique des analyses en Excel",
+            data=fichier_excel.getvalue(),
+            file_name="analyses_clauses.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )

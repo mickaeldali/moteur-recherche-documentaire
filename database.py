@@ -3,8 +3,9 @@ database.py
 
 Communication avec la base SQLite : métadonnées des documents (table
 `documents`, identique au projet 2), index de recherche plein texte (table
-virtuelle FTS5 `documents_fts`, projet 3) et index de recherche par sens
-(table `documents_embeddings`, nouveauté de cette étape).
+virtuelle FTS5 `documents_fts`, projet 3), index de recherche par sens
+(table `documents_embeddings`, étape embeddings) et historique des analyses
+de clauses (table `documents_clauses`, projet 5).
 
 Le fichier réel (PDF/DOCX/TXT) n'est jamais stocké ici : seule son adresse
 (le champ `chemin`) est mémorisée. Le fichier physique est géré par
@@ -15,8 +16,12 @@ fichiers.py, le texte qu'il contient par extraction.py.
 - `documents_embeddings` mémorise, pour chaque morceau (chunk) de texte, son
   vecteur numérique (embedding), pour la recherche par SENS : on y compare
   le vecteur de la requête à celui de chaque chunk avec une similarité
-  cosinus (voir embeddings.py). Les deux index sont reliés à `documents`
-  par `doc_id`.
+  cosinus (voir embeddings.py).
+- `documents_clauses` mémorise, pour chaque analyse de clause demandée par
+  l'utilisateur (un type de clause + un document), le résultat obtenu :
+  présence, extrait, analyse rédigée et niveau de risque (voir clauses.py).
+
+Les trois index sont reliés à `documents` par `doc_id`.
 """
 
 import json
@@ -69,6 +74,25 @@ def initialiser_base():
             chunk_id INTEGER NOT NULL,
             texte_chunk TEXT NOT NULL,
             vecteur TEXT NOT NULL
+        )
+    """)
+
+    # Historique des analyses de clauses (projet 5). clause_presente est
+    # stockée en INTEGER (0 ou 1) : SQLite n'a pas de type booléen natif.
+    # analyse et niveau_risque peuvent rester NULL : soit la clause est
+    # absente (rien à analyser), soit l'appel au LLM a échoué après une
+    # détection réussie (voir clauses.py) -- dans les deux cas, la ligne
+    # est quand même enregistrée plutôt que perdue.
+    curseur.execute("""
+        CREATE TABLE IF NOT EXISTS documents_clauses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id INTEGER NOT NULL,
+            type_clause TEXT NOT NULL,
+            clause_presente INTEGER NOT NULL,
+            texte_extrait TEXT,
+            analyse TEXT,
+            niveau_risque TEXT,
+            date_analyse TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -175,12 +199,13 @@ def modifier_document(id_document, categorie, commentaire):
 
 
 def supprimer_document(id_document):
-    """Supprime le document : sa ligne de métadonnées et ses lignes dans les deux index de recherche."""
+    """Supprime le document : sa ligne de métadonnées et ses lignes dans les trois index/historiques."""
     connexion = sqlite3.connect(DB_PATH)
     curseur = connexion.cursor()
     curseur.execute("DELETE FROM documents WHERE id = ?", (id_document,))
     curseur.execute("DELETE FROM documents_fts WHERE doc_id = ?", (id_document,))
     curseur.execute("DELETE FROM documents_embeddings WHERE doc_id = ?", (id_document,))
+    curseur.execute("DELETE FROM documents_clauses WHERE doc_id = ?", (id_document,))
     connexion.commit()
     connexion.close()
 
@@ -240,7 +265,7 @@ def rechercher(texte_recherche, categorie=None):
     return resultats
 
 
-def rechercher_par_sens(texte_requete, categorie=None, top_n=5):
+def rechercher_par_sens(texte_requete, categorie=None, doc_id=None, top_n=5):
     """
     Recherche par SENS : retrouve les chunks dont le sens se rapproche le
     plus de `texte_requete`, même s'ils ne partagent aucun mot avec elle
@@ -255,6 +280,9 @@ def rechercher_par_sens(texte_requete, categorie=None, top_n=5):
     texte_requete : la question/le passage tapé par l'utilisateur.
     categorie : si fourni (et différent de "Toutes"), restreint la
         recherche aux documents de cette catégorie.
+    doc_id : si fourni, restreint la recherche aux chunks de CE document
+        (utilisé par le projet 5 : détecter une clause dans un document
+        précis, pas dans tout le corpus).
     top_n : nombre maximum de chunks retournés (les plus proches en sens).
 
     Retourne une liste de tuples, du plus proche au moins proche :
@@ -281,10 +309,16 @@ def rechercher_par_sens(texte_requete, categorie=None, top_n=5):
         FROM documents_embeddings e
         JOIN documents d ON d.id = e.doc_id
     """
+    conditions = []
     parametres = []
     if categorie and categorie != "Toutes":
-        sql += " WHERE d.categorie = ?"
+        conditions.append("d.categorie = ?")
         parametres.append(categorie)
+    if doc_id is not None:
+        conditions.append("e.doc_id = ?")
+        parametres.append(doc_id)
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
 
     curseur.execute(sql, parametres)
     lignes = curseur.fetchall()
@@ -299,3 +333,61 @@ def rechercher_par_sens(texte_requete, categorie=None, top_n=5):
 
     resultats_scores.sort(key=lambda resultat: resultat[-1], reverse=True)
     return resultats_scores[:top_n]
+
+
+def enregistrer_analyse_clause(
+    doc_id, type_clause, clause_presente, texte_extrait, analyse=None, niveau_risque=None,
+):
+    """
+    Enregistre le résultat d'une analyse de clause (projet 5) : présente ou
+    non, avec (si présente) son texte exact, et (si l'appel au LLM a
+    réussi) l'analyse rédigée et le niveau de risque.
+
+    analyse et niveau_risque restent None si la clause est absente, ou si
+    la détection a réussi mais que l'analyse par le LLM a échoué (clé
+    absente, quota, réseau...) : la ligne est quand même enregistrée plutôt
+    que perdue, avec de quoi repérer une clause "détectée mais pas encore
+    analysée" dans l'export.
+    """
+    connexion = sqlite3.connect(DB_PATH)
+    curseur = connexion.cursor()
+    curseur.execute("""
+        INSERT INTO documents_clauses
+            (doc_id, type_clause, clause_presente, texte_extrait, analyse, niveau_risque)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (doc_id, type_clause, int(clause_presente), texte_extrait, analyse, niveau_risque))
+    connexion.commit()
+    connexion.close()
+
+
+def lire_analyses_clauses(doc_id=None):
+    """
+    Retourne l'historique des analyses de clauses, du plus récent au plus
+    ancien, jointe à `documents` pour le nom du fichier.
+
+    doc_id : si fourni, restreint l'historique à ce document ; sinon,
+    retourne l'historique complet (utilisé pour l'export Excel global).
+
+    Retourne une liste de tuples :
+    (id, nom, type_clause, clause_presente, texte_extrait, analyse,
+     niveau_risque, date_analyse)
+    """
+    connexion = sqlite3.connect(DB_PATH)
+    curseur = connexion.cursor()
+
+    sql = """
+        SELECT c.id, d.nom, c.type_clause, c.clause_presente, c.texte_extrait,
+               c.analyse, c.niveau_risque, c.date_analyse
+        FROM documents_clauses c
+        JOIN documents d ON d.id = c.doc_id
+    """
+    parametres = []
+    if doc_id is not None:
+        sql += " WHERE c.doc_id = ?"
+        parametres.append(doc_id)
+    sql += " ORDER BY c.date_analyse DESC"
+
+    curseur.execute(sql, parametres)
+    resultats = curseur.fetchall()
+    connexion.close()
+    return resultats

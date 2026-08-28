@@ -207,3 +207,96 @@ def test_rechercher_par_sens_texte_vide_retourne_rien(tmp_path, monkeypatch):
     # aucun appel API, la fonction doit s'arrêter avant.
     assert database.rechercher_par_sens("") == []
     assert database.rechercher_par_sens("   ") == []
+
+
+def test_rechercher_par_sens_filtre_par_doc_id(tmp_path, monkeypatch):
+    # Utilisé par le projet 5 : détecter une clause dans UN document précis,
+    # pas dans tout le corpus.
+    base_test = tmp_path / "test_documents.db"
+    monkeypatch.setattr(database, "DB_PATH", base_test)
+    monkeypatch.setattr(embeddings, "calculer_embedding", lambda texte: [1.0, 0.0])
+
+    database.initialiser_base()
+    id_bail = database.ajouter_document("Bail.pdf", "pdf", "Immobilier", "documents/Bail.pdf")
+    id_contrat = database.ajouter_document("Contrat.pdf", "pdf", "Contrats", "documents/Contrat.pdf")
+    database.indexer_embeddings(id_bail, "Clause de resiliation du bail.")
+    database.indexer_embeddings(id_contrat, "Clause de resiliation du contrat.")
+
+    resultats = database.rechercher_par_sens("resiliation", doc_id=id_contrat)
+
+    assert len(resultats) == 1
+    assert resultats[0][0] == id_contrat
+
+
+# ---------------------------------------------------------------------------
+# Historique des analyses de clauses (projet 5). Aucun appel réseau.
+# ---------------------------------------------------------------------------
+
+def test_enregistrer_et_lire_analyse_clause_presente(tmp_path, monkeypatch):
+    base_test = tmp_path / "test_documents.db"
+    monkeypatch.setattr(database, "DB_PATH", base_test)
+
+    database.initialiser_base()
+    id_doc = database.ajouter_document("Contrat.pdf", "pdf", "Contrats", "documents/Contrat.pdf")
+
+    database.enregistrer_analyse_clause(
+        id_doc, "non-concurrence", clause_presente=True,
+        texte_extrait="Le salarié ne peut pas travailler pour un concurrent.",
+        analyse="Clause large, sans contrepartie financière.",
+        niveau_risque="élevé",
+    )
+
+    analyses = database.lire_analyses_clauses(id_doc)
+
+    assert len(analyses) == 1
+    assert analyses[0][1] == "Contrat.pdf"
+    assert analyses[0][2] == "non-concurrence"
+    assert analyses[0][3] == 1  # clause_presente stockée en INTEGER
+    assert analyses[0][6] == "élevé"
+
+
+def test_enregistrer_analyse_clause_absente_sans_analyse(tmp_path, monkeypatch):
+    base_test = tmp_path / "test_documents.db"
+    monkeypatch.setattr(database, "DB_PATH", base_test)
+
+    database.initialiser_base()
+    id_doc = database.ajouter_document("Contrat.pdf", "pdf", "Contrats", "documents/Contrat.pdf")
+
+    database.enregistrer_analyse_clause(
+        id_doc, "confidentialité", clause_presente=False, texte_extrait=None,
+    )
+
+    analyses = database.lire_analyses_clauses(id_doc)
+
+    assert len(analyses) == 1
+    assert analyses[0][3] == 0
+    assert analyses[0][4] is None  # texte_extrait
+    assert analyses[0][5] is None  # analyse
+    assert analyses[0][6] is None  # niveau_risque
+
+
+def test_lire_analyses_clauses_sans_doc_id_retourne_tout(tmp_path, monkeypatch):
+    base_test = tmp_path / "test_documents.db"
+    monkeypatch.setattr(database, "DB_PATH", base_test)
+
+    database.initialiser_base()
+    id_bail = database.ajouter_document("Bail.pdf", "pdf", "Immobilier", "documents/Bail.pdf")
+    id_contrat = database.ajouter_document("Contrat.pdf", "pdf", "Contrats", "documents/Contrat.pdf")
+    database.enregistrer_analyse_clause(id_bail, "résiliation", True, "extrait bail")
+    database.enregistrer_analyse_clause(id_contrat, "confidentialité", True, "extrait contrat")
+
+    assert len(database.lire_analyses_clauses()) == 2
+    assert len(database.lire_analyses_clauses(id_bail)) == 1
+
+
+def test_supprimer_document_nettoie_aussi_les_analyses_de_clauses(tmp_path, monkeypatch):
+    base_test = tmp_path / "test_documents.db"
+    monkeypatch.setattr(database, "DB_PATH", base_test)
+
+    database.initialiser_base()
+    id_doc = database.ajouter_document("Contrat.pdf", "pdf", "Contrats", "documents/Contrat.pdf")
+    database.enregistrer_analyse_clause(id_doc, "non-concurrence", True, "extrait")
+
+    database.supprimer_document(id_doc)
+
+    assert database.lire_analyses_clauses() == []
