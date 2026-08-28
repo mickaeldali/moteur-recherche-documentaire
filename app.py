@@ -1,16 +1,19 @@
 """
 app.py
 
-Interface Streamlit du moteur de recherche documentaire (projet 3 + étape
-recherche par sens).
+Interface Streamlit du moteur de recherche documentaire (projet 3 + étapes
+recherche par sens et RAG / projet 4).
 
 Reprend l'import de documents du projet 2 (fichiers.py, extraction.py,
-database.py) et propose deux façons de rechercher dans le CONTENU TEXTUEL
-des documents (pas seulement leurs métadonnées comme au projet 2) :
+database.py) et propose trois façons d'interroger le CONTENU TEXTUEL des
+documents (pas seulement leurs métadonnées comme au projet 2) :
 - par MOTS-CLÉS, grâce à l'index plein texte FTS5 (projet 3) ;
-- par SENS, grâce aux embeddings OpenAI (cette étape) : retrouve un passage
-  même s'il ne partage aucun mot avec la requête, tant que le sens est
-  proche.
+- par SENS, grâce aux embeddings OpenAI (étape embeddings) : retrouve un
+  passage même s'il ne partage aucun mot avec la requête, tant que le sens
+  est proche ;
+- en POSANT UNE QUESTION (projet 4, RAG) : retrouve les passages pertinents
+  par sens, puis les envoie à un LLM qui rédige une vraie réponse -- tout en
+  affichant séparément les extraits bruts, pour rester vérifiable.
 """
 
 from pathlib import Path
@@ -21,6 +24,7 @@ import database
 import embeddings
 import extraction
 import fichiers
+import llm
 
 CATEGORIES = [
     "Corporate", "Contrats", "Contentieux", "Fiscal", "Social",
@@ -111,27 +115,31 @@ if st.button("Importer le document"):
 st.divider()
 
 # ----------------------------------------------------------------------
-# Recherche dans le contenu des documents : par mots-clés (FTS5) ou par
-# sens (embeddings). Les deux cherchent dans le même contenu texte, mais
-# ne comparent pas la même chose : la première compare des mots, la
-# seconde compare des vecteurs numériques représentant le sens.
+# Recherche dans le contenu des documents, trois modes possibles. Les
+# trois interrogent le même contenu texte, mais pas de la même façon :
+# mots-clés compare des mots, par sens compare des vecteurs numériques
+# représentant le sens, et poser une question ajoute une étape de
+# génération : le LLM rédige une réponse à partir des passages retrouvés
+# par sens (RAG -- retrieval-augmented generation, projet 4).
 # ----------------------------------------------------------------------
 st.header("Rechercher dans les documents")
 
 mode_recherche = st.radio(
     "Mode de recherche",
-    ["Mots-clés (FTS5)", "Par sens (embeddings)"],
+    ["Mots-clés (FTS5)", "Par sens (embeddings)", "Poser une question (IA)"],
     horizontal=True,
     help=(
         "Mots-clés : retrouve les mots tapés tels quels (ou leur préfixe). "
         "Par sens : retrouve les passages dont le SENS se rapproche de la "
-        "requête, même avec des mots différents. Nécessite une clé API "
+        "requête, même avec des mots différents. Poser une question : en "
+        "plus de retrouver les passages, un LLM rédige une réponse à "
+        "partir d'eux. Les deux derniers modes nécessitent une clé API "
         "OpenAI configurée dans .env."
     ),
 )
 recherche_texte = st.text_input(
-    "Rechercher dans le contenu",
-    placeholder="ex. clause de non-concurrence",
+    "Rechercher dans le contenu, ou poser une question",
+    placeholder="ex. clause de non-concurrence, ou : quel est le préavis de résiliation du bail ?",
 )
 categorie_filtre = st.selectbox("Filtrer par catégorie", ["Toutes"] + CATEGORIES)
 
@@ -189,11 +197,11 @@ if mode_recherche == "Mots-clés (FTS5)":
                 else:
                     st.warning("Coche la case de confirmation avant de supprimer.")
 
-else:
-    # Mode "Par sens" : un appel API est nécessaire pour calculer l'embedding
-    # de la requête elle-même, donc les mêmes erreurs qu'à l'import peuvent
-    # survenir (clé absente, réseau, quota). On les affiche clairement au
-    # lieu de faire planter la page.
+elif mode_recherche == "Par sens (embeddings)":
+    # Un appel API est nécessaire pour calculer l'embedding de la requête
+    # elle-même, donc les mêmes erreurs qu'à l'import peuvent survenir (clé
+    # absente, réseau, quota). On les affiche clairement au lieu de faire
+    # planter la page.
     if not recherche_texte.strip():
         resultats_sens = []
     else:
@@ -215,3 +223,57 @@ else:
             st.write(f"Type : {type_fichier}")
             st.write(f"Chemin : {chemin}")
             st.markdown(f"Passage correspondant : *{texte_chunk}*")
+
+else:
+    # Mode "Poser une question" (RAG, projet 4) : on retrouve d'abord les
+    # passages pertinents par sens (comme le mode précédent), puis on les
+    # envoie à un LLM qui rédige une réponse à partir d'eux -- jamais à
+    # partir de sa propre mémoire des documents, puisqu'il n'en a aucune.
+    if not recherche_texte.strip():
+        chunks_pertinents = []
+    else:
+        try:
+            resultats_bruts = database.rechercher_par_sens(
+                recherche_texte, categorie_filtre, top_n=llm.NB_CHUNKS_CONTEXTE,
+            )
+            chunks_pertinents = llm.filtrer_chunks_pertinents(resultats_bruts)
+        except embeddings.CleApiManquante as erreur:
+            st.error(str(erreur))
+            chunks_pertinents = []
+        except Exception as erreur:
+            st.error(f"Recherche indisponible : {erreur}")
+            chunks_pertinents = []
+
+    if recherche_texte.strip() and not chunks_pertinents:
+        st.info("Aucun passage suffisamment pertinent n'a été trouvé pour répondre à cette question.")
+
+    if chunks_pertinents:
+        # La génération de la réponse est un second appel API, séparé de la
+        # recherche des passages ci-dessus : s'il échoue (clé absente,
+        # quota, réseau...), les passages bruts restent affichés plus bas,
+        # seule la synthèse rédigée est indisponible.
+        try:
+            reponse = llm.generer_reponse(recherche_texte, chunks_pertinents)
+
+            st.success(f"Réponse trouvée dans le document : {reponse['reponse_document']}")
+
+            if reponse["complement_connaissance_generale"]:
+                st.warning(
+                    "Connaissance générale du LLM (hors document, à vérifier) : "
+                    f"{reponse['complement_connaissance_generale']}"
+                )
+        except embeddings.CleApiManquante as erreur:
+            st.error(str(erreur))
+        except Exception as erreur:
+            st.error(f"Impossible de générer une réponse rédigée : {erreur}")
+
+        # Sources : les extraits bruts tels que stockés en base, jamais
+        # reformulés par le LLM -- c'est sur eux que la réponse peut être
+        # vérifiée.
+        st.subheader("Sources")
+        for resultat in chunks_pertinents:
+            id_doc, nom, type_fichier, categorie, date_ajout, chemin, commentaire, texte_chunk, score = resultat
+            with st.expander(f"{nom} — {categorie} — proximité de sens {score:.2f}"):
+                st.write(f"Type : {type_fichier}")
+                st.write(f"Chemin : {chemin}")
+                st.markdown(f"Extrait original : *{texte_chunk}*")

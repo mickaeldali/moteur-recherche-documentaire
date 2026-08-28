@@ -36,8 +36,13 @@ class CleApiManquante(Exception):
     """Levée quand OPENAI_API_KEY n'est pas définie (ni dans .env, ni dans l'environnement)."""
 
 
-def _client():
-    """Construit un client OpenAI, ou lève CleApiManquante si aucune clé n'est configurée."""
+def client_openai():
+    """
+    Construit un client OpenAI, ou lève CleApiManquante si aucune clé n'est
+    configurée. Publique (pas de préfixe _) car réutilisée par llm.py, qui a
+    besoin du même client pour appeler le modèle de chat : pas de raison de
+    dupliquer la logique de lecture de la clé API à deux endroits.
+    """
     cle = os.getenv("OPENAI_API_KEY")
     if not cle:
         raise CleApiManquante(
@@ -115,7 +120,7 @@ def calculer_embedding(texte):
     deux cas sont volontairement laissés remonter : c'est à l'appelant
     (database.py, puis app.py) de décider comment réagir à un échec.
     """
-    reponse = _client().embeddings.create(model=MODELE_EMBEDDING, input=texte)
+    reponse = client_openai().embeddings.create(model=MODELE_EMBEDDING, input=texte)
     return reponse.data[0].embedding
 
 
