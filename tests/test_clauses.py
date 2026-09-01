@@ -1,6 +1,7 @@
 import json
 
 import clauses
+import database
 import embeddings
 import llm
 
@@ -128,3 +129,111 @@ def test_analyser_clause_signale_une_fausse_detection(monkeypatch):
     resultat = clauses.analyser_clause("propriété intellectuelle", chunks)
 
     assert resultat["clause_correspond"] is False
+
+
+def test_construire_messages_inclut_verification_et_red_flags_si_fournis():
+    chunks = [_faux_resultat("Contrat.pdf", "texte", 0.5)]
+
+    messages = clauses.construire_messages_clause(
+        "résiliation", chunks,
+        ce_qu_il_faut_verifier="préavis, motifs de résiliation",
+        red_flags="résiliation unilatérale sans préavis",
+    )
+
+    assert "préavis, motifs de résiliation" in messages[1]["content"]
+    assert "résiliation unilatérale sans préavis" in messages[1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# detecter_et_analyser : orchestration des deux étapes, ne lève jamais
+# d'exception. database.rechercher_par_sens est mockée directement (pas de
+# vraie base SQLite nécessaire pour ces tests).
+# ---------------------------------------------------------------------------
+
+def test_detecter_et_analyser_detection_indisponible(monkeypatch):
+    def fausse_recherche(*args, **kwargs):
+        raise embeddings.CleApiManquante("pas de clé")
+    monkeypatch.setattr(database, "rechercher_par_sens", fausse_recherche)
+
+    resultat = clauses.detecter_et_analyser(1, "non-concurrence")
+
+    assert resultat["statut"] == "detection_indisponible"
+    assert "erreur" in resultat
+
+
+def test_detecter_et_analyser_absente_aucun_candidat(monkeypatch):
+    monkeypatch.setattr(database, "rechercher_par_sens", lambda *a, **k: [])
+
+    resultat = clauses.detecter_et_analyser(1, "confidentialité")
+
+    assert resultat["statut"] == "absente"
+    assert resultat["clause_presente"] is False
+    assert resultat["texte_extrait"] is None
+
+
+def test_detecter_et_analyser_absente_rejetee_par_verification(monkeypatch):
+    chunks = [_faux_resultat("Contrat.pdf", "texte hors sujet", 0.4)]
+    monkeypatch.setattr(database, "rechercher_par_sens", lambda *a, **k: chunks)
+    _mocker_client_openai(monkeypatch, {
+        "clause_correspond": False,
+        "analyse": "Ne correspond pas.",
+        "niveau_risque": "faible",
+    })
+
+    resultat = clauses.detecter_et_analyser(1, "propriété intellectuelle")
+
+    assert resultat["statut"] == "absente"
+    assert resultat["clause_presente"] is False
+
+
+def test_detecter_et_analyser_presente(monkeypatch):
+    chunks = [_faux_resultat("Contrat.pdf", "Duree de douze mois de non-concurrence.", 0.5)]
+    monkeypatch.setattr(database, "rechercher_par_sens", lambda *a, **k: chunks)
+    _mocker_client_openai(monkeypatch, {
+        "clause_correspond": True,
+        "analyse": "Clause large, risque important.",
+        "niveau_risque": "élevé",
+    })
+
+    resultat = clauses.detecter_et_analyser(1, "non-concurrence")
+
+    assert resultat["statut"] == "presente"
+    assert resultat["clause_presente"] is True
+    assert resultat["texte_extrait"] == "Duree de douze mois de non-concurrence."
+    assert resultat["analyse"] == "Clause large, risque important."
+    assert resultat["niveau_risque"] == "élevé"
+
+
+def test_detecter_et_analyser_detectee_non_analysee(monkeypatch):
+    chunks = [_faux_resultat("Contrat.pdf", "texte candidat", 0.5)]
+    monkeypatch.setattr(database, "rechercher_par_sens", lambda *a, **k: chunks)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    resultat = clauses.detecter_et_analyser(1, "non-concurrence")
+
+    assert resultat["statut"] == "detectee_non_analysee"
+    assert resultat["clause_presente"] is True
+    assert resultat["texte_extrait"] == "texte candidat"
+    assert resultat["analyse"] is None
+    assert resultat["niveau_risque"] is None
+    assert "erreur" in resultat
+
+
+def test_detecter_et_analyser_transmet_verification_et_red_flags(monkeypatch):
+    chunks = [_faux_resultat("Contrat.pdf", "texte", 0.5)]
+    monkeypatch.setattr(database, "rechercher_par_sens", lambda *a, **k: chunks)
+    appels = {}
+    _mocker_client_openai(monkeypatch, {
+        "clause_correspond": True,
+        "analyse": "ok",
+        "niveau_risque": "faible",
+    }, appels=appels)
+
+    clauses.detecter_et_analyser(
+        1, "résiliation",
+        ce_qu_il_faut_verifier="préavis", red_flags="résiliation abusive",
+    )
+
+    contenu_envoye = appels["messages"][1]["content"]
+    assert "préavis" in contenu_envoye
+    assert "résiliation abusive" in contenu_envoye

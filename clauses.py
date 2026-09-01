@@ -26,13 +26,23 @@ n'est donc qu'un CANDIDAT, jamais une confirmation :
 2. analyser_clause() demande au LLM de vérifier lui-même, en lisant le
    contexte, si ces candidats correspondent VRAIMENT au type de clause
    demandé (champ clause_correspond du schéma, orienté précision) avant de
-   produire une analyse. Si ce n'est pas le cas, l'appelant (app.py) doit
-   traiter la clause comme absente, même si l'étape 1 avait trouvé un
-   candidat au-dessus du seuil.
+   produire une analyse. Si ce n'est pas le cas, la clause est traitée
+   comme absente, même si l'étape 1 avait trouvé un candidat au-dessus du
+   seuil.
+
+detecter_et_analyser() orchestre ces deux étapes pour UN document et UN
+type de clause, sans jamais lever d'exception (contrairement à
+analyser_clause() elle-même) : c'est la fonction partagée entre le bouton
+"Analyser une clause" de app.py (projet 5, un document à la fois, type de
+clause tapé librement) et due_diligence.py (projet final, exécutée en
+parallèle sur tous les documents × les 24 catégories fixes, où une
+exception non rattrapée dans une tâche ferait perdre le résultat des
+autres).
 """
 
 import json
 
+import database
 import embeddings
 import llm
 
@@ -112,11 +122,17 @@ INSTRUCTIONS_SYSTEME_CLAUSE = (
 )
 
 
-def construire_messages_clause(type_clause, chunks_pertinents):
+def construire_messages_clause(type_clause, chunks_pertinents, ce_qu_il_faut_verifier=None, red_flags=None):
     """
     Assemble les messages envoyés à l'API : instructions système, puis le
     type de clause demandé accompagné du contexte (les chunks pertinents
     retrouvés dans le document, numérotés).
+
+    ce_qu_il_faut_verifier et red_flags sont optionnels : quand fournis
+    (par due_diligence.py, pour une des 24 catégories fixes), ils enrichissent
+    le message pour guider une analyse plus précise et cohérente d'une
+    catégorie à l'autre, plutôt qu'un simple nom de clause tapé librement
+    (usage projet 5, ces deux paramètres restent à None).
 
     Fonction pure (aucun appel réseau) : testable directement.
     """
@@ -126,10 +142,12 @@ def construire_messages_clause(type_clause, chunks_pertinents):
         passages.append(f"Extrait {i + 1} :\n{texte_chunk}")
     contexte = "\n\n".join(passages)
 
-    message_utilisateur = (
-        f"Type de clause à analyser : {type_clause}\n\n"
-        f"Extraits du contrat (contexte) :\n{contexte}"
-    )
+    message_utilisateur = f"Type de clause à analyser : {type_clause}\n"
+    if ce_qu_il_faut_verifier:
+        message_utilisateur += f"\nCe qu'il faut vérifier : {ce_qu_il_faut_verifier}\n"
+    if red_flags:
+        message_utilisateur += f"\nRed flags typiques : {red_flags}\n"
+    message_utilisateur += f"\nExtraits du contrat (contexte) :\n{contexte}"
 
     return [
         {"role": "system", "content": INSTRUCTIONS_SYSTEME_CLAUSE},
@@ -137,20 +155,22 @@ def construire_messages_clause(type_clause, chunks_pertinents):
     ]
 
 
-def analyser_clause(type_clause, chunks_pertinents):
+def analyser_clause(type_clause, chunks_pertinents, ce_qu_il_faut_verifier=None, red_flags=None):
     """
     Envoie le type de clause et son contexte (chunks_pertinents, déjà
     filtrés au-dessus du seuil de pertinence) au modèle de chat, avec un
     format de sortie JSON imposé (SCHEMA_ANALYSE_CLAUSE).
 
-    Retourne un dict {"analyse": str, "niveau_risque": "faible"|"moyen"|"élevé"}.
+    ce_qu_il_faut_verifier/red_flags : voir construire_messages_clause().
+
+    Retourne un dict {"clause_correspond": bool, "analyse": str, "niveau_risque": "faible"|"moyen"|"élevé"}.
 
     Ne rattrape volontairement aucune erreur (même principe que
     llm.generer_reponse) : CleApiManquante ou une exception de la
-    librairie openai remonte jusqu'à l'appelant (app.py), qui décide
-    comment réagir sans perdre la détection déjà obtenue.
+    librairie openai remonte jusqu'à l'appelant, qui décide comment réagir
+    sans perdre la détection déjà obtenue.
     """
-    messages = construire_messages_clause(type_clause, chunks_pertinents)
+    messages = construire_messages_clause(type_clause, chunks_pertinents, ce_qu_il_faut_verifier, red_flags)
 
     reponse = embeddings.client_openai().chat.completions.create(
         model=llm.MODELE_CHAT,
@@ -159,3 +179,67 @@ def analyser_clause(type_clause, chunks_pertinents):
     )
 
     return json.loads(reponse.choices[0].message.content)
+
+
+def detecter_et_analyser(doc_id, type_clause, ce_qu_il_faut_verifier=None, red_flags=None):
+    """
+    Orchestre les deux étapes de détection (voir docstring du fichier) pour
+    UN document et UN type de clause, sans jamais lever d'exception : les
+    échecs sont capturés et reflétés dans la valeur de retour, jamais
+    propagés. C'est ce qui permet de réutiliser cette fonction aussi bien
+    depuis un bouton de app.py (projet 5, un appel à la fois) que depuis un
+    thread de due_diligence.py (potentiellement des dizaines d'appels en
+    parallèle, où une exception non rattrapée ferait perdre le résultat
+    des autres tâches du lot).
+
+    Retourne toujours un dict avec une clé "statut" :
+    - "detection_indisponible" : l'étape 1 (recherche des candidats) a
+      échoué (clé API absente, réseau, quota) -- rien à enregistrer, le
+      dict contient aussi "erreur" (message explicatif).
+    - "absente" : aucun candidat trouvé, ou candidat(s) trouvé(s) mais le
+      LLM a confirmé (clause_correspond=false) qu'ils ne correspondent
+      pas réellement au type de clause demandé.
+    - "presente" : clause confirmée et analysée.
+    - "detectee_non_analysee" : un candidat a été trouvé mais l'étape 2
+      (vérification + analyse par le LLM) a échoué -- le dict contient
+      aussi "erreur", "analyse"/"niveau_risque" restant None (résilience :
+      la détection n'est pas perdue).
+
+    Dans tous les cas sauf "detection_indisponible", le dict contient aussi
+    doc_id, type_clause, clause_presente, texte_extrait, analyse,
+    niveau_risque : prêt à être passé à database.enregistrer_analyse_clause().
+    """
+    try:
+        resultats_bruts = database.rechercher_par_sens(type_clause, doc_id=doc_id, top_n=llm.NB_CHUNKS_CONTEXTE)
+        chunks_candidats = llm.filtrer_chunks_pertinents(resultats_bruts)
+    except Exception as erreur:
+        return {"statut": "detection_indisponible", "erreur": str(erreur)}
+
+    resultat = {
+        "doc_id": doc_id, "type_clause": type_clause,
+        "clause_presente": False, "texte_extrait": None, "analyse": None, "niveau_risque": None,
+    }
+
+    if not chunks_candidats:
+        resultat["statut"] = "absente"
+        return resultat
+
+    try:
+        resultat_llm = analyser_clause(type_clause, chunks_candidats, ce_qu_il_faut_verifier, red_flags)
+    except Exception as erreur:
+        resultat["clause_presente"] = True
+        resultat["texte_extrait"] = "\n\n".join(r[-2] for r in chunks_candidats)
+        resultat["statut"] = "detectee_non_analysee"
+        resultat["erreur"] = str(erreur)
+        return resultat
+
+    if not resultat_llm["clause_correspond"]:
+        resultat["statut"] = "absente"
+        return resultat
+
+    resultat["clause_presente"] = True
+    resultat["texte_extrait"] = "\n\n".join(r[-2] for r in chunks_candidats)
+    resultat["analyse"] = resultat_llm["analyse"]
+    resultat["niveau_risque"] = resultat_llm["niveau_risque"]
+    resultat["statut"] = "presente"
+    return resultat

@@ -289,6 +289,59 @@ def test_lire_analyses_clauses_sans_doc_id_retourne_tout(tmp_path, monkeypatch):
     assert len(database.lire_analyses_clauses(id_bail)) == 1
 
 
+def test_compter_analyses_par_risque_compte_par_type_et_niveau(tmp_path, monkeypatch):
+    base_test = tmp_path / "test_documents.db"
+    monkeypatch.setattr(database, "DB_PATH", base_test)
+
+    database.initialiser_base()
+    id1 = database.ajouter_document("A.pdf", "pdf", "Contrats", "documents/A.pdf")
+    id2 = database.ajouter_document("B.pdf", "pdf", "Contrats", "documents/B.pdf")
+    database.enregistrer_analyse_clause(id1, "Résiliation", True, "extrait", "analyse", "élevé")
+    database.enregistrer_analyse_clause(id2, "Résiliation", True, "extrait", "analyse", "élevé")
+    database.enregistrer_analyse_clause(id1, "Confidentialité", False, None)
+
+    comptages = database.compter_analyses_par_risque()
+
+    assert ("Résiliation", "élevé", 2) in comptages
+    assert ("Confidentialité", None, 1) in comptages
+
+
+def test_compter_analyses_par_risque_filtre_par_types_clause(tmp_path, monkeypatch):
+    base_test = tmp_path / "test_documents.db"
+    monkeypatch.setattr(database, "DB_PATH", base_test)
+
+    database.initialiser_base()
+    id1 = database.ajouter_document("A.pdf", "pdf", "Contrats", "documents/A.pdf")
+    database.enregistrer_analyse_clause(id1, "Résiliation", True, "extrait", "analyse", "élevé")
+    database.enregistrer_analyse_clause(id1, "recherche libre projet 5", True, "extrait", "analyse", "moyen")
+
+    comptages = database.compter_analyses_par_risque(types_clause=["Résiliation"])
+
+    assert comptages == [("Résiliation", "élevé", 1)]
+
+
+def test_compter_analyses_par_risque_ignore_les_analyses_perimees(tmp_path, monkeypatch):
+    # Cas découvert en concevant l'agrégation : si le même document est
+    # réanalysé pour la même catégorie (relance du scan du data room), il
+    # ne doit compter qu'une fois, avec son résultat le plus récent -- même
+    # si les deux lignes ont exactement le même date_analyse (résolution à
+    # la seconde de CURRENT_TIMESTAMP) : le départage se fait sur id, pas
+    # sur la date seule.
+    base_test = tmp_path / "test_documents.db"
+    monkeypatch.setattr(database, "DB_PATH", base_test)
+
+    database.initialiser_base()
+    id1 = database.ajouter_document("A.pdf", "pdf", "Contrats", "documents/A.pdf")
+    database.enregistrer_analyse_clause(id1, "Résiliation", True, "extrait", "premiere analyse", "élevé")
+    database.enregistrer_analyse_clause(id1, "Résiliation", True, "extrait", "analyse plus recente", "faible")
+
+    comptages = database.compter_analyses_par_risque()
+
+    # Une seule ligne comptée pour ce document+catégorie, avec le niveau de
+    # risque de l'analyse la plus récente (faible), pas les deux.
+    assert comptages == [("Résiliation", "faible", 1)]
+
+
 def test_supprimer_document_nettoie_aussi_les_analyses_de_clauses(tmp_path, monkeypatch):
     base_test = tmp_path / "test_documents.db"
     monkeypatch.setattr(database, "DB_PATH", base_test)

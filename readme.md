@@ -1,6 +1,6 @@
 # Moteur de recherche documentaire
 
-Projet n°3 du parcours LegalTech — application locale qui permet d'interroger le **contenu texte** des documents juridiques importés, et non plus seulement leurs métadonnées comme au projet 2. Trois façons de chercher coexistent : FTS5 (mots-clés, plein texte classique), une recherche par **sens** (embeddings OpenAI), et depuis le projet 4, la possibilité de **poser une question** à laquelle un LLM rédige une vraie réponse à partir des passages retrouvés (RAG -- retrieval-augmented generation), avec citation systématique des extraits bruts pour rester vérifiable. Depuis le projet 5, un mini **assistant d'analyse contractuelle** détecte un type de clause tapé librement dans un document, l'analyse et lui attribue un niveau de risque, avec un historique exportable en Excel.
+Projet n°3 du parcours LegalTech — application locale qui permet d'interroger le **contenu texte** des documents juridiques importés, et non plus seulement leurs métadonnées comme au projet 2. Trois façons de chercher coexistent : FTS5 (mots-clés, plein texte classique), une recherche par **sens** (embeddings OpenAI), et depuis le projet 4, la possibilité de **poser une question** à laquelle un LLM rédige une vraie réponse à partir des passages retrouvés (RAG -- retrieval-augmented generation), avec citation systématique des extraits bruts pour rester vérifiable. Depuis le projet 5, un mini **assistant d'analyse contractuelle** détecte un type de clause tapé librement dans un document, l'analyse et lui attribue un niveau de risque, avec un historique exportable en Excel. Étape finale du parcours : un **assistant de due diligence / data room**, qui généralise cette analyse de clause à tous les documents importés sur une liste fixe de 24 catégories juridiques standards, en parallèle, avec une matrice de risques croisée et une synthèse rédigée par IA.
 
 ## Fonctionnalités
 
@@ -27,6 +27,13 @@ Projet n°3 du parcours LegalTech — application locale qui permet d'interroger
   - le texte cité reste, comme pour le RAG, l'extrait brut stocké en base, jamais reformulé par le LLM
   - chaque analyse est enregistrée durablement (table `documents_clauses`), pour accumuler plusieurs analyses sans refaire d'appels API déjà payés
   - export Excel de tout l'historique accumulé (`pandas` + `openpyxl`, en mémoire, même principe que le projet 1)
+- **Analyse du data room** (projet final, assistant de due diligence) :
+  - un bouton lance l'analyse de TOUS les documents importés sur une liste fixe de 24 catégories juridiques standards (parties, durée, résiliation, change of control, propriété intellectuelle, données personnelles...), chacune avec ce qu'il faut vérifier et des red flags typiques envoyés au LLM pour guider l'analyse
+  - même détection en deux étapes que "Analyser une clause", réutilisée telle quelle (`clauses.detecter_et_analyser`), lancée en **parallèle** (jusqu'à 8 combinaisons document x catégorie à la fois) puisque les appels API sont I/O-bound (le temps est passé à attendre le réseau, pas à calculer localement)
+  - chaque case (document x catégorie) capture ses propres erreurs indépendamment : l'échec d'une case n'empêche ni les autres de s'exécuter, ni de s'enregistrer
+  - **matrice de risques croisée** (documents en lignes, catégories en colonnes), colorée par niveau de risque
+  - **synthèse rédigée par IA** : d'abord un comptage fiable par SQL (`GROUP BY type_clause, niveau_risque`), puis ce résumé chiffré (jamais les analyses brutes) envoyé à un appel LLM séparé qui rédige un texte de synthèse global des points d'attention
+  - le mode "Analyser une clause" (recherche libre, un document à la fois) reste disponible en complément, pour des vérifications ponctuelles hors des 24 catégories fixes
 - Filtre par catégorie juridique, combinable avec les trois modes de recherche
 - Une recherche vide (mode mots-clés) affiche tous les documents (comme au projet 2)
 - Aperçu du texte extrait, modification (catégorie/commentaire), suppression (base + fichier + les deux index)
@@ -35,6 +42,7 @@ Projet n°3 du parcours LegalTech — application locale qui permet d'interroger
   - si l'indexation par sens échoue (pas de clé API OpenAI, pas de réseau, quota dépassé...), le document reste importé et trouvable par mots-clés, avec un message clair indiquant qu'il ne sera pas trouvable par une recherche par sens
 - Résilience du mode « Poser une question » : si la génération de la réponse échoue (clé absente, quota, réseau), les passages bruts retrouvés restent affichés, seule la synthèse rédigée est indisponible, avec un message clair
 - Résilience de l'analyse de clauses : si la détection réussit mais que l'analyse par le LLM échoue, la clause est quand même enregistrée comme « détectée mais pas encore analysée », plutôt que de perdre la détection
+- Résilience du lot data room : chaque case a son propre filet de sécurité (aucune exception ne peut se propager et interrompre les autres cases en cours), même en cas de bug totalement imprévu
 
 ## Structure du projet
 
@@ -45,7 +53,8 @@ moteur_recherche_documentaire/
 ├── recherche.py       # construction de la requête FTS5 à partir du texte tapé
 ├── embeddings.py       # découpage en chunks, appel à l'API OpenAI (embeddings), similarité cosinus
 ├── llm.py               # RAG : prompt, appel au modèle de chat, schéma JSON imposé (projet 4)
-├── clauses.py            # analyse de clauses : prompt, vérification + schéma JSON imposé (projet 5)
+├── clauses.py            # analyse de clauses : prompt, détection en deux étapes, schéma JSON (projet 5)
+├── due_diligence.py       # 24 catégories, parallélisme, matrice, agrégation SQL, synthèse (projet final)
 ├── fichiers.py         # sauvegarde/suppression physique des fichiers (repris du projet 2)
 ├── extraction.py       # extraction du texte PDF/DOCX/TXT (repris du projet 2)
 ├── documents/           # fichiers importés (non versionné)
@@ -58,6 +67,7 @@ moteur_recherche_documentaire/
 │   ├── test_embeddings.py
 │   ├── test_llm.py
 │   ├── test_clauses.py
+│   ├── test_due_diligence.py
 │   ├── test_fichiers.py
 │   └── test_extraction.py
 ├── requirements.txt
@@ -92,7 +102,7 @@ streamlit run app.py
 python -m pytest -v
 ```
 
-Les tests ne font aucun appel réseau réel à l'API OpenAI : `calculer_embedding` est mocké dans `test_embeddings.py` et `test_database.py`, `generer_reponse` (chat) dans `test_llm.py`, `analyser_clause` (chat) dans `test_clauses.py`.
+Les tests ne font aucun appel réseau réel à l'API OpenAI : `calculer_embedding` est mocké dans `test_embeddings.py` et `test_database.py`, `generer_reponse` (chat) dans `test_llm.py`, `analyser_clause`/`detecter_et_analyser` (chat) dans `test_clauses.py`, `generer_synthese` (chat) dans `test_due_diligence.py` -- de même que `lancer_analyse_data_room` (ThreadPoolExecutor), testée avec `clauses.detecter_et_analyser` mocké plutôt qu'avec de vrais appels API.
 
 ## Note d'architecture : pourquoi FTS5
 
@@ -148,3 +158,19 @@ La détection se fait donc en deux étapes, avec un rôle différent à chacune 
 **Citation et stockage**, mêmes principes que le RAG : le texte affiché (`texte_extrait`) est toujours l'extrait brut tel que stocké en base, jamais reformulé par le LLM. Chaque analyse est enregistrée durablement dans `documents_clauses` (`doc_id`, `type_clause`, `clause_presente`, `texte_extrait`, `analyse`, `niveau_risque`, `date_analyse`), y compris en cas d'échec de l'appel au LLM après une détection réussie (`analyse`/`niveau_risque` restent `NULL` : « détectée mais pas encore analysée » plutôt qu'une détection perdue) -- accumuler l'historique évite de refaire des appels API déjà payés, et prépare le terrain pour le projet final (due diligence multi-documents).
 
 **Export Excel** (`app.py`) : même principe que le projet 1 (`pandas.ExcelWriter` + `openpyxl` pour la mise en forme, fichier construit en mémoire via `io.BytesIO`, jamais écrit sur disque), une ligne par analyse enregistrée dans `documents_clauses`, tous documents confondus.
+
+## Note d'architecture : l'analyse du data room (projet final, `due_diligence.py`)
+
+Dernière étape du parcours : généraliser "Analyser une clause" (un document, un type de clause tapé librement) à un **data room entier** (tous les documents, une liste fixe de 24 catégories juridiques standards), avec une matrice de risques et une synthèse globale.
+
+**Réutilisation, pas duplication.** Le bouton "Analyser une clause" (projet 5) et le scan du data room appellent tous les deux `clauses.detecter_et_analyser(doc_id, type_clause, ce_qu_il_faut_verifier=None, red_flags=None)`, extraite pendant cette étape de ce qui était auparavant codé en dur dans `app.py`. Cette fonction ne lève jamais d'exception : elle retourne toujours un dict avec une clé `"statut"` (`"detection_indisponible"`, `"absente"`, `"presente"` ou `"detectee_non_analysee"`), ce qui permet de la réutiliser aussi bien depuis un bouton (un appel à la fois) que depuis un thread parallèle (où une exception ferait perdre le résultat des autres tâches du lot). Les deux paramètres optionnels (`ce_qu_il_faut_verifier`, `red_flags`) enrichissent le prompt envoyé au LLM avec les critères de la catégorie fixe, plutôt qu'un simple nom de clause tapé librement.
+
+**Les 24 catégories** (`due_diligence.CATEGORIES_DUE_DILIGENCE`) : une liste de dictionnaires `{"nom", "verification", "red_flags"}`, checklist standard de due diligence contractuelle (parties/périmètre, objet, durée, résiliation, change of control, cession, prix, engagements de volume/exclusivité, responsabilité, indemnisation, garanties, propriété intellectuelle, confidentialité, données personnelles/cybersécurité, sous-traitance, SLA, audit, non-concurrence, compliance, assurance, force majeure, droit applicable, modification du contrat, survie des obligations).
+
+**Parallélisme** (`due_diligence.lancer_analyse_data_room`, `concurrent.futures.ThreadPoolExecutor`, `max_workers=8`) : chaque case de la matrice (document x catégorie) passe par un ou deux appels à l'API OpenAI. Ces appels sont **I/O-bound** : l'essentiel du temps est passé à *attendre* une réponse réseau, pas à calculer localement -- plusieurs peuvent donc être lancés en même temps sans ralentir le CPU de la machine (contrairement à un traitement CPU-bound, où le parallélisme n'aiderait pas au-delà du nombre de coeurs, et où un GPU ferait une différence -- pas ici, le calcul se fait côté serveurs OpenAI). `max_workers` limite quand même le nombre d'appels simultanés pour respecter les limites de débit ("rate limits") de l'API, au-delà desquelles elle renvoie des erreurs HTTP 429.
+
+Les threads ne font QUE des appels API et des lectures SQLite (sans risque en lecture concurrente). **L'écriture en base se fait uniquement dans le thread principal**, au fur et à mesure que les résultats arrivent (`as_completed`) -- ce qui évite complètement toute question d'écriture SQLite concurrente entre threads. `analyser_case()` (soumise à chaque thread) a en plus son propre filet de sécurité (`try/except` autour de l'appel à `detecter_et_analyser`) : même si cette dernière ne devrait normalement jamais lever d'exception, un bug totalement imprévu dans un thread ne doit jamais faire perdre le résultat des dizaines d'autres tâches du lot en interrompant la boucle du thread principal.
+
+**Matrice de risques** (`due_diligence.construire_matrice`) : pivote `database.lire_analyses_clauses()` en tableau documents x catégories avec `pandas`, coloré par niveau de risque (`st.dataframe(matrice.style.map(...))`). Ne garde que la ligne la **plus récente** par (document, catégorie) : sans ça, relancer l'analyse du data room après l'ajout de nouveaux documents laisserait d'anciennes valeurs mélangées aux nouvelles.
+
+**Agrégation SQL puis synthèse LLM** (`due_diligence.agreger_resultats_data_room` + `generer_synthese`) : `database.compter_analyses_par_risque()` fait un vrai `GROUP BY type_clause, niveau_risque` en SQL -- c'est le code qui compte, jamais le LLM. Point technique à noter : le dédoublonnage "ligne la plus récente par (document, catégorie)" se fait sur `id` (auto-incrémenté, toujours unique) plutôt que sur `date_analyse`, car `CURRENT_TIMESTAMP` n'a qu'une résolution à la seconde en SQLite -- deux lignes écrites la même seconde (plausible avec le lot parallélisé) auraient sinon la même valeur et fausseraient le comptage. Le texte compact obtenu (jamais les analyses brutes) est ensuite envoyé à un unique appel LLM séparé qui rédige la synthèse. Contrairement aux autres appels LLM du projet, **pas de schéma JSON strict** ici : la sortie est un seul texte narratif, sans champ à distinguer d'un autre (pas de séparation contexte/connaissance générale comme au RAG, pas de vérification comme aux clauses) -- imposer une structure n'aurait rien apporté.

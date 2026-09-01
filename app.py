@@ -19,6 +19,11 @@ S'y ajoute une section "Analyser une clause" (projet 5) : pour un document
 et un type de clause tapé librement, détecte si la clause existe (même
 principe que "par sens" et le RAG), la fait analyser par un LLM avec un
 niveau de risque, et permet d'exporter l'historique accumulé en Excel.
+
+Enfin, une section "Analyse du data room" (projet final) généralise ce
+principe à TOUS les documents x une liste fixe de 24 catégories juridiques
+standards, en parallèle (due_diligence.py), avec une matrice de risques
+croisée et une synthèse rédigée par le LLM à partir d'une agrégation SQL.
 """
 
 import io
@@ -31,6 +36,7 @@ from openpyxl.utils import get_column_letter
 
 import clauses
 import database
+import due_diligence
 import embeddings
 import extraction
 import fichiers
@@ -317,67 +323,27 @@ else:
         if not type_clause.strip():
             st.warning("Tape d'abord un type de clause.")
         else:
-            # Étape 1 : détection PRÉLIMINAIRE, restreinte à CE document
-            # (doc_id) -- même principe que la recherche par sens et le
-            # RAG : un chunk est jugé CANDIDAT au-dessus de
-            # llm.SEUIL_SIMILARITE_MINIMAL. Un candidat n'est pas une
-            # confirmation : voir clauses.py, la similarité de sens seule
-            # peut confondre deux clauses de même domaine juridique.
-            try:
-                resultats_bruts = database.rechercher_par_sens(
-                    type_clause, doc_id=doc_id_choisi, top_n=llm.NB_CHUNKS_CONTEXTE,
-                )
-                chunks_candidats = llm.filtrer_chunks_pertinents(resultats_bruts)
-            except embeddings.CleApiManquante as erreur:
-                st.error(str(erreur))
-                chunks_candidats = None
-            except Exception as erreur:
-                st.error(f"Détection indisponible : {erreur}")
-                chunks_candidats = None
+            # Toute la logique de détection en deux étapes (candidats par
+            # similarité de sens, puis vérification + analyse par le LLM)
+            # est dans clauses.detecter_et_analyser() -- partagée avec
+            # due_diligence.py, qui l'utilise en parallèle sur tous les
+            # documents x les 24 catégories fixes du data room. Ici, on ne
+            # fait qu'afficher le message correspondant au statut retourné.
+            resultat = clauses.detecter_et_analyser(doc_id_choisi, type_clause)
 
-            # chunks_candidats à None = la détection elle-même a échoué :
-            # on ne sait pas si la clause est présente, donc on n'enregistre
-            # rien. [] = aucun candidat trouvé, absence claire : ça
-            # s'enregistre directement, sans appel au LLM.
-            if chunks_candidats is not None:
-                clause_presente, texte_extrait, analyse, niveau_risque = False, None, None, None
-
-                if not chunks_candidats:
+            if resultat["statut"] == "detection_indisponible":
+                st.error(f"Détection indisponible : {resultat['erreur']}")
+            else:
+                if resultat["statut"] == "absente":
                     st.info(f"Aucune clause de type « {type_clause} » détectée dans ce document.")
-                else:
-                    # Étape 2 : le LLM vérifie lui-même si les candidats
-                    # correspondent VRAIMENT au type de clause demandé
-                    # (clause_correspond) avant d'analyser -- c'est cette
-                    # vérification, pas le score de similarité, qui décide
-                    # de la présence finale. Si l'appel échoue, la ligne
-                    # est quand même enregistrée comme "détectée mais non
-                    # vérifiée/analysée", pour ne pas perdre le candidat
-                    # déjà trouvé (résilience demandée).
-                    try:
-                        resultat_analyse = clauses.analyser_clause(type_clause, chunks_candidats)
-                        if resultat_analyse["clause_correspond"]:
-                            clause_presente = True
-                            texte_extrait = "\n\n".join(r[-2] for r in chunks_candidats)
-                            analyse = resultat_analyse["analyse"]
-                            niveau_risque = resultat_analyse["niveau_risque"]
-                            st.success("Clause détectée et analysée.")
-                        else:
-                            st.info(
-                                f"Un passage proche par le sens a été trouvé, mais l'IA a "
-                                f"vérifié qu'il ne correspond pas à une clause de type "
-                                f"« {type_clause} » : absente."
-                            )
-                    except embeddings.CleApiManquante as erreur:
-                        clause_presente = True
-                        texte_extrait = "\n\n".join(r[-2] for r in chunks_candidats)
-                        st.warning(f"Clause candidate détectée mais non vérifiée/analysée : {erreur}")
-                    except Exception as erreur:
-                        clause_presente = True
-                        texte_extrait = "\n\n".join(r[-2] for r in chunks_candidats)
-                        st.warning(f"Clause candidate détectée mais non vérifiée/analysée : {erreur}")
+                elif resultat["statut"] == "presente":
+                    st.success("Clause détectée et analysée.")
+                elif resultat["statut"] == "detectee_non_analysee":
+                    st.warning(f"Clause candidate détectée mais non vérifiée/analysée : {resultat['erreur']}")
 
                 database.enregistrer_analyse_clause(
-                    doc_id_choisi, type_clause, clause_presente, texte_extrait, analyse, niveau_risque,
+                    resultat["doc_id"], resultat["type_clause"], resultat["clause_presente"],
+                    resultat["texte_extrait"], resultat["analyse"], resultat["niveau_risque"],
                 )
                 st.rerun()
 
@@ -447,3 +413,71 @@ else:
             file_name="analyses_clauses.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+st.divider()
+
+# ----------------------------------------------------------------------
+# Analyse du data room (projet final) : généralise "Analyser une clause"
+# ci-dessus à TOUS les documents x une liste fixe de 24 catégories
+# juridiques standards (due_diligence.py), exécutées en parallèle. Produit
+# une matrice de risques croisée et une synthèse rédigée par le LLM à
+# partir d'une agrégation SQL (jamais des analyses brutes).
+# ----------------------------------------------------------------------
+st.header("Analyse du data room")
+
+st.write(
+    "Analyse tous les documents importés sur une liste fixe de 24 catégories "
+    "juridiques standards de due diligence (parties, durée, résiliation, "
+    "propriété intellectuelle, confidentialité, données personnelles...), "
+    "en parallèle. Peut prendre plusieurs minutes selon le nombre de documents."
+)
+
+if not documents_existants:
+    st.info("Importe d'abord des documents pour lancer l'analyse du data room.")
+else:
+    if st.button("Lancer l'analyse du data room"):
+        barre_progression = st.progress(0.0)
+        texte_progression = st.empty()
+
+        def afficher_progression(nb_fait, nb_total):
+            barre_progression.progress(nb_fait / nb_total)
+            texte_progression.write(f"{nb_fait} / {nb_total} cases analysées (document x catégorie)")
+
+        with st.spinner("Analyse du data room en cours..."):
+            due_diligence.lancer_analyse_data_room(on_resultat=afficher_progression)
+
+        st.success("Analyse du data room terminée.")
+        st.rerun()
+
+    st.subheader("Matrice de risques")
+
+    matrice = due_diligence.construire_matrice(database.lire_analyses_clauses())
+
+    if matrice.empty:
+        st.write("Aucune analyse du data room enregistrée pour l'instant.")
+    else:
+        # Coloration des cellules selon le niveau de risque -- même esprit
+        # que les badges de la section "Analyser une clause" ci-dessus,
+        # mais appliqué à toute la matrice d'un coup.
+        COULEURS_RISQUE = {
+            "Élevé": "background-color: #f8d7da",
+            "Moyen": "background-color: #fff3cd",
+            "Faible": "background-color: #d4edda",
+            "Absente": "background-color: #f0f0f0",
+            "Détectée (non analysée)": "background-color: #e2e3e5",
+        }
+        st.dataframe(matrice.style.map(lambda valeur: COULEURS_RISQUE.get(valeur, "")))
+
+        st.subheader("Synthèse")
+        if st.button("Générer la synthèse du data room"):
+            # Agrégation SQL d'abord (comptage fiable, fait par le code),
+            # puis un seul appel LLM séparé pour rédiger le texte -- jamais
+            # les analyses brutes envoyées au modèle.
+            try:
+                comptages_texte = due_diligence.agreger_resultats_data_room()
+                synthese = due_diligence.generer_synthese(comptages_texte)
+                st.write(synthese)
+            except embeddings.CleApiManquante as erreur:
+                st.error(str(erreur))
+            except Exception as erreur:
+                st.error(f"Impossible de générer la synthèse : {erreur}")

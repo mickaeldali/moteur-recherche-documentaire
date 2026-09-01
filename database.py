@@ -385,7 +385,61 @@ def lire_analyses_clauses(doc_id=None):
     if doc_id is not None:
         sql += " WHERE c.doc_id = ?"
         parametres.append(doc_id)
-    sql += " ORDER BY c.date_analyse DESC"
+    # id en second critère de tri : CURRENT_TIMESTAMP n'a qu'une résolution
+    # à la seconde, id (auto-incrémenté) départage correctement deux lignes
+    # écrites la même seconde, dans l'ordre réel d'écriture.
+    sql += " ORDER BY c.date_analyse DESC, c.id DESC"
+
+    curseur.execute(sql, parametres)
+    resultats = curseur.fetchall()
+    connexion.close()
+    return resultats
+
+
+def compter_analyses_par_risque(types_clause=None):
+    """
+    Compte, pour chaque (type_clause, niveau_risque), le nombre de
+    documents dans cet état -- une vraie agrégation SQL (GROUP BY), pas un
+    comptage fait par le LLM (voir due_diligence.py : c'est ce comptage qui
+    sert de base chiffrée à la synthèse rédigée par le LLM, jamais les
+    analyses brutes).
+
+    types_clause : si fourni, restreint le comptage à ces types de clause
+    (utilisé par due_diligence.py pour ignorer les recherches libres du
+    projet 5 et ne compter que les 24 catégories fixes du data room).
+
+    Important : ne compte que la ligne la PLUS RÉCENTE par (doc_id,
+    type_clause), via la sous-requête `WHERE c.id = (SELECT MAX(id)...)`
+    ci-dessous. Sans ça, relancer l'analyse du data room une deuxième fois
+    (après l'ajout de nouveaux documents, par exemple) compterait deux fois
+    les documents déjà analysés la première fois, faussant la synthèse. Le
+    tri se fait sur `id` (auto-incrémenté, donc toujours unique et dans
+    l'ordre d'écriture) plutôt que sur `date_analyse` : `CURRENT_TIMESTAMP`
+    n'a qu'une résolution à la seconde en SQLite, deux lignes écrites dans
+    la même seconde (plausible avec le lot parallélisé) auraient la même
+    valeur et ne seraient pas départagées correctement par une date seule.
+
+    Retourne une liste de tuples (type_clause, niveau_risque, nombre),
+    niveau_risque valant None pour les clauses absentes ou détectées mais
+    pas encore analysées (donc sans niveau de risque).
+    """
+    connexion = sqlite3.connect(DB_PATH)
+    curseur = connexion.cursor()
+
+    sql = """
+        SELECT c.type_clause, c.niveau_risque, COUNT(*)
+        FROM documents_clauses c
+        WHERE c.id = (
+            SELECT MAX(c2.id) FROM documents_clauses c2
+            WHERE c2.doc_id = c.doc_id AND c2.type_clause = c.type_clause
+        )
+    """
+    parametres = []
+    if types_clause:
+        marqueurs = ", ".join("?" for _ in types_clause)
+        sql += f" AND c.type_clause IN ({marqueurs})"
+        parametres.extend(types_clause)
+    sql += " GROUP BY c.type_clause, c.niveau_risque"
 
     curseur.execute(sql, parametres)
     resultats = curseur.fetchall()
