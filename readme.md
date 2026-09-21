@@ -1,5 +1,5 @@
 # Moteur de recherche documentaire
-
+![Capture d'écran de l'application](docs/Screenshot.png)
 Projet n°3 du parcours LegalTech — application locale qui permet d'interroger le **contenu texte** des documents juridiques importés, et non plus seulement leurs métadonnées comme au projet 2. Trois façons de chercher coexistent : FTS5 (mots-clés, plein texte classique), une recherche par **sens** (embeddings OpenAI), et depuis le projet 4, la possibilité de **poser une question** à laquelle un LLM rédige une vraie réponse à partir des passages retrouvés (RAG -- retrieval-augmented generation), avec citation systématique des extraits bruts pour rester vérifiable. Depuis le projet 5, un mini **assistant d'analyse contractuelle** détecte un type de clause tapé librement dans un document, l'analyse et lui attribue un niveau de risque, avec un historique exportable en Excel. Étape finale du parcours : un **assistant de due diligence / data room**, qui généralise cette analyse de clause à tous les documents importés sur une liste fixe de 24 catégories juridiques standards, en parallèle, avec une matrice de risques croisée et une synthèse rédigée par IA.
 
 ## Fonctionnalités
