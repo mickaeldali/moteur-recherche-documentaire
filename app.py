@@ -38,6 +38,7 @@ import clauses
 import database
 import due_diligence
 import embeddings
+import export_excel
 import extraction
 import fichiers
 import llm
@@ -389,6 +390,10 @@ else:
             for (_, nom, type_clause_ligne, presente, texte_extrait, analyse_texte, niveau_risque, date_analyse) in analyses
         ]
         df_export = pd.DataFrame(lignes_export, columns=colonnes)
+        # Excel refuse certains caractères de contrôle invisibles (parfois
+        # présents dans le texte du LLM ou d'un PDF) : on les retire ici,
+        # à l'export seulement -- la base n'est pas modifiée.
+        df_export = export_excel.nettoyer_dataframe_pour_excel(df_export)
 
         fichier_excel = io.BytesIO()
         with pd.ExcelWriter(fichier_excel, engine="openpyxl") as writer:
